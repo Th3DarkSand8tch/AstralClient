@@ -166,6 +166,35 @@ Deux modifications de sources, nécessaires et signalées à l'exécution :
 
 ---
 
+## Mode debug
+
+Quand une étape échoue sans explication suffisante :
+
+```bash
+sudo ./install.sh --debug --email vous@exemple.com --admin-name VotrePseudo --yes
+```
+
+Ce que ça change :
+
+- **Trace de chaque commande** dans `/var/log/endless-install.debug.log`, préfixée
+  `fichier:ligne:fonction`. Elle part sur un descripteur séparé, donc le terminal
+  reste lisible — c'est le fichier qui contient tout.
+- **Rien n'est étouffé** : les 42 redirections vers `/dev/null` deviennent
+  visibles, et `apt`, `npm` et `cargo` passent en verbeux.
+- **Sur erreur, une pile d'appel** en plus de la ligne et de la commande fautive.
+- Un **état de la machine** en tête de trace : noyau, distribution, RAM, disque,
+  chemins des outils. La moitié des pannes d'installation se lisent là.
+
+Même sans `--debug`, toute erreur affiche désormais la ligne et la commande
+exacte : le script ne rend plus la main en silence.
+
+> **La trace contient les mots de passe en clair.** `set -x` développe chaque
+> variable, donc `DATABASE_URL`, `ADMIN_PASSWORD`, le secret S3 et les clés
+> Stripe y apparaissent. Le fichier est créé en `0600` ; supprimez-le une fois le
+> diagnostic terminé, et relisez-le avant de le coller où que ce soit.
+
+---
+
 ## Dépannage
 
 ```bash

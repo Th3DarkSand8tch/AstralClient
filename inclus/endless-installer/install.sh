@@ -48,8 +48,18 @@ SKIP_DNS_CHECK=0
 SEED_DEMO=0
 PATCH_POLYPLUS=0
 ASSUME_YES=0
+DEBUG=0
 
 LOG_FILE="/var/log/endless-install.log"
+DEBUG_LOG="/var/log/endless-install.debug.log"
+
+# Pilotes de verbosite, bascules d'un bloc par --debug. NULL doit etre defini
+# ici, avant le moindre usage : toutes les redirections du script passent par
+# lui, et `set -u` ferait tout sauter sur une variable non definie.
+NULL="/dev/null"
+APT_Q="-qq"
+NPM_FLAGS="--no-audit --no-fund"
+CARGO_FLAGS=""
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Sortie
@@ -70,7 +80,26 @@ die()  { printf '\n%s     ERREUR %s%s\n\n' "$C_ERR" "$*" "$C_RESET" >&2; exit 1;
 # Sans ce piege, `set -e` rend la main sans un mot : on revient au prompt sans
 # savoir quelle commande a echoue ni a quelle ligne. Pour un installeur non
 # interactif c'est le pire mode d'echec possible.
-trap 'die "echec ligne $LINENO : $BASH_COMMAND"' ERR
+on_error() {
+  local code=$?          # doit rester la premiere instruction
+  local line="$1" cmd="$2"
+  printf '\n%s     ERREUR ligne %s (code %s)%s\n' "$C_ERR" "$line" "$code" "$C_RESET" >&2
+  printf '%s       commande : %s%s\n' "$C_ERR" "$cmd" "$C_RESET" >&2
+  if (( DEBUG )); then
+    printf '%s       pile d appel :%s\n' "$C_ERR" "$C_RESET" >&2
+    local i
+    for (( i = 1; i < ${#FUNCNAME[@]}; i++ )); do
+      printf '         %s() <- %s:%s\n' \
+        "${FUNCNAME[i]}" "${BASH_SOURCE[i]##*/}" "${BASH_LINENO[i-1]}" >&2
+    done
+    printf '\n       trace complete : %s\n' "$DEBUG_LOG" >&2
+  else
+    printf '\n       relancez avec --debug pour la trace complete de chaque commande\n' >&2
+  fi
+  printf '       journal        : %s\n\n' "$LOG_FILE" >&2
+  exit "$code"
+}
+trap 'on_error "$LINENO" "$BASH_COMMAND"' ERR
 
 usage() {
   cat <<'USAGE'
@@ -100,6 +129,9 @@ Ajustements
   --seed-demo               Charge le catalogue de demonstration (TRUNCATE !)
   --patch-polyplus          Reecrit BackendUrl.kt vers https://api.<domaine>
   --yes                     Aucune question, tout en automatique
+  --debug                   Trace complete : chaque commande avec son numero de
+                            ligne dans /var/log/endless-install.debug.log, plus
+                            apt/npm/cargo verbeux et sortie jamais etouffee
   -h, --help                Cette aide
 
 Exemple
@@ -127,6 +159,7 @@ while [[ $# -gt 0 ]]; do
     --seed-demo)             SEED_DEMO=1; shift ;;
     --patch-polyplus)        PATCH_POLYPLUS=1; shift ;;
     --yes|-y)                ASSUME_YES=1; shift ;;
+    --debug)                 DEBUG=1; shift ;;
     -h|--help)               usage; exit 0 ;;
     *)                       usage; die "option inconnue : $1" ;;
   esac
@@ -156,7 +189,14 @@ URL_CDN="$SCHEME://$HOST_CDN"
 # ─────────────────────────────────────────────────────────────────────────────
 # Aides
 # ─────────────────────────────────────────────────────────────────────────────
-as_service_user() { sudo -u "$SERVICE_USER" bash -lc "$1"; }
+# GIT_TERMINAL_PROMPT=0 et BatchMode : une invite d'authentification git ou ssh
+# echoue immediatement au lieu de figer l'installation sur une question que
+# personne ne lit. sudo remet l'environnement a zero, donc ces variables doivent
+# etre posees dans la commande elle-meme, pas exportees par le parent.
+as_service_user() {
+  sudo -u "$SERVICE_USER" bash -lc \
+    "export GIT_TERMINAL_PROMPT=0 GIT_SSH_COMMAND='ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new'; $1"
+}
 
 gen_secret() { openssl rand -base64 36 | tr -d '\n/+=' | cut -c1-40; }
 
@@ -182,7 +222,7 @@ remember() {
 wait_for_port() {
   local port="$1" timeout="${2:-60}" waited=0
   while (( waited < timeout )); do
-    if (exec 3<>"/dev/tcp/127.0.0.1/$port") 2>/dev/null; then exec 3>&- 2>/dev/null || true; return 0; fi
+    if (exec 3<>"/dev/tcp/127.0.0.1/$port") 2>"$NULL"; then exec 3>&- 2>"$NULL" || true; return 0; fi
     sleep 2; waited=$((waited + 2))
   done
   return 1
@@ -216,6 +256,24 @@ esac
 mkdir -p "$(dirname "$LOG_FILE")"
 exec > >(tee -a "$LOG_FILE") 2>&1
 
+if (( DEBUG )); then
+  # La sortie normalement jetee redevient visible, et les gestionnaires de
+  # paquets cessent de se taire.
+  NULL="/dev/stderr"
+  APT_Q=""
+  NPM_FLAGS="--no-audit --no-fund --loglevel verbose"
+  CARGO_FLAGS="--verbose"
+
+  # La trace part sur son propre descripteur : le terminal reste lisible et le
+  # fichier contient tout. PS4 donne fichier:ligne:fonction pour chaque commande.
+  : > "$DEBUG_LOG"
+  chmod 600 "$DEBUG_LOG"
+  exec 9>>"$DEBUG_LOG"
+  export BASH_XTRACEFD=9
+  export PS4='+ ${BASH_SOURCE##*/}:${LINENO}:${FUNCNAME[0]:-main}(): '
+  set -x
+fi
+
 printf '\n%s  EndlessClient — installation automatique%s\n' "$C_STEP" "$C_RESET"
 printf '  domaine   %s\n' "$DOMAIN"
 printf '  systeme   %s\n' "${PRETTY_NAME:-inconnu}"
@@ -226,20 +284,39 @@ else
   printf "  TLS       Let's Encrypt, %s\n" "$LETSENCRYPT_EMAIL"
 fi
 
+if (( DEBUG )); then
+  printf '  debug     %s\n' "$DEBUG_LOG"
+  printf '%s  !! la trace contient les mots de passe en clair (set -x) : fichier en\n' "$C_WARN"
+  printf '     0600, a supprimer une fois le diagnostic termine.%s\n' "$C_RESET"
+  # Etat de la machine : la moitie des pannes d'installation se lisent ici.
+  {
+    printf '\n===== environnement =====\n'
+    printf '%s\n' "$(uname -a)"
+    printf '%s\n' "${PRETTY_NAME:-inconnu}"
+    printf -- '--- memoire ---\n';  free -h        2>&1 || true
+    printf -- '--- disque ---\n';   df -h /  /opt  2>&1 || true
+    printf -- '--- versions ---\n'
+    for tool in bash git curl node npm psql nginx openssl; do
+      printf '%-8s %s\n' "$tool" "$(command -v "$tool" 2>&1 || echo absent)"
+    done
+    printf '=========================\n\n'
+  } >&9 2>&1
+fi
+
 # ─────────────────────────────────────────────────────────────────────────────
 step "Paquets systeme"
 # ─────────────────────────────────────────────────────────────────────────────
 export DEBIAN_FRONTEND=noninteractive
-apt-get update -qq
-apt-get -y -qq install \
+apt-get update $APT_Q
+apt-get -y $APT_Q install \
   build-essential pkg-config libssl-dev git curl ca-certificates \
   nginx ufw unzip zip jq openssl dnsutils apache2-utils \
   postgresql postgresql-contrib
 ok "outils de base, nginx, postgresql"
 
-if ! command -v node >/dev/null 2>&1 || [[ "$(node --version | sed 's/^v\([0-9]*\).*/\1/')" -lt 20 ]]; then
+if ! command -v node >"$NULL" 2>&1 || [[ "$(node --version | sed 's/^v\([0-9]*\).*/\1/')" -lt 20 ]]; then
   curl -fsSL https://deb.nodesource.com/setup_22.x | bash -
-  apt-get -y -qq install nodejs
+  apt-get -y $APT_Q install nodejs
 fi
 ok "node $(node --version), npm $(npm --version)"
 
@@ -249,7 +326,7 @@ step "DNS"
 if (( SKIP_DNS_CHECK )); then
   note "verification ignoree (--skip-dns-check)"
 else
-  public_ip="$(curl -fsS --max-time 10 https://api.ipify.org 2>/dev/null || true)"
+  public_ip="$(curl -fsS --max-time 10 https://api.ipify.org 2>"$NULL" || true)"
   [[ -n "$public_ip" ]] && ok "IP publique de ce serveur : $public_ip" || true
   dns_ok=1
   for host in "${ALL_HOSTS[@]}"; do
@@ -271,7 +348,7 @@ fi
 # ─────────────────────────────────────────────────────────────────────────────
 step "Utilisateur de service et arborescence"
 # ─────────────────────────────────────────────────────────────────────────────
-if ! id -u "$SERVICE_USER" >/dev/null 2>&1; then
+if ! id -u "$SERVICE_USER" >"$NULL" 2>&1; then
   useradd --system --create-home --home-dir "$BASE_DIR" --shell /usr/sbin/nologin "$SERVICE_USER"
   ok "utilisateur '$SERVICE_USER' cree"
 else
@@ -289,24 +366,14 @@ ok "$BASE_DIR/{src,bin,web,secrets}"
 # ─────────────────────────────────────────────────────────────────────────────
 step "Pare-feu"
 # ─────────────────────────────────────────────────────────────────────────────
-ufw allow OpenSSH >/dev/null
-ufw allow 'Nginx Full' >/dev/null
-ufw --force enable >/dev/null
+ufw allow OpenSSH >"$NULL"
+ufw allow 'Nginx Full' >"$NULL"
+ufw --force enable >"$NULL"
 ok "ufw : SSH + HTTP/HTTPS uniquement, le reste passe par nginx en loopback"
 
 # ─────────────────────────────────────────────────────────────────────────────
 step "Sources"
 # ─────────────────────────────────────────────────────────────────────────────
-# plus-website/package-lock.json epingle skinview3d sur
-# git+ssh://git@github.com/Polyfrost/skinview3d.git. Sur un serveur neuf il n'y a
-# ni cle SSH ni known_hosts : git pose sa question de verification d'hote et
-# `npm ci` se fige indefiniment, sans message. Le depot est public, donc on
-# reecrit vers https. Sans ca, l'etape "Boutique" ne se termine jamais.
-as_service_user 'git config --global --unset-all url."https://github.com/".insteadOf || true'
-as_service_user 'git config --global --add url."https://github.com/".insteadOf "ssh://git@github.com/"'
-as_service_user 'git config --global --add url."https://github.com/".insteadOf "git@github.com:"'
-ok "github.com reecrit en https pour '$SERVICE_USER' (dependances git)"
-
 # plus-website/package-lock.json epingle skinview3d sur
 # git+ssh://git@github.com/Polyfrost/skinview3d.git. Sur un serveur neuf il n'y a
 # ni cle SSH ni known_hosts : git pose sa question de verification d'hote et
@@ -365,19 +432,19 @@ ok "5 secrets generes ou relus depuis $STATE_DIR"
 # ─────────────────────────────────────────────────────────────────────────────
 step "PostgreSQL"
 # ─────────────────────────────────────────────────────────────────────────────
-systemctl enable --now postgresql >/dev/null
+systemctl enable --now postgresql >"$NULL"
 role_exists="$(sudo -u postgres psql -tAc "SELECT 1 FROM pg_roles WHERE rolname='$DB_USER'")"
 if [[ "$role_exists" == "1" ]]; then
-  sudo -u postgres psql -qc "ALTER ROLE $DB_USER LOGIN PASSWORD '$DB_PASSWORD'" >/dev/null
+  sudo -u postgres psql -qc "ALTER ROLE $DB_USER LOGIN PASSWORD '$DB_PASSWORD'" >"$NULL"
   ok "role '$DB_USER' mis a jour"
 else
-  sudo -u postgres psql -qc "CREATE ROLE $DB_USER LOGIN PASSWORD '$DB_PASSWORD'" >/dev/null
+  sudo -u postgres psql -qc "CREATE ROLE $DB_USER LOGIN PASSWORD '$DB_PASSWORD'" >"$NULL"
   ok "role '$DB_USER' cree"
 fi
 
 db_exists="$(sudo -u postgres psql -tAc "SELECT 1 FROM pg_database WHERE datname='$DB_NAME'")"
 if [[ "$db_exists" != "1" ]]; then
-  sudo -u postgres psql -qc "CREATE DATABASE $DB_NAME OWNER $DB_USER" >/dev/null
+  sudo -u postgres psql -qc "CREATE DATABASE $DB_NAME OWNER $DB_USER" >"$NULL"
   ok "base '$DB_NAME' creee"
 else
   ok "base '$DB_NAME' deja presente"
@@ -385,7 +452,7 @@ fi
 
 # pg_trgm exige le superutilisateur : on l'installe ici pour que le role
 # applicatif n'ait pas besoin de ce privilege pendant les migrations.
-sudo -u postgres psql -d "$DB_NAME" -qc 'CREATE EXTENSION IF NOT EXISTS pg_trgm' >/dev/null
+sudo -u postgres psql -d "$DB_NAME" -qc 'CREATE EXTENSION IF NOT EXISTS pg_trgm' >"$NULL"
 ok "extension pg_trgm installee"
 
 listen="$(sudo -u postgres psql -tAc 'SHOW listen_addresses')"
@@ -398,23 +465,23 @@ fi
 # ─────────────────────────────────────────────────────────────────────────────
 step "Stockage objet (MinIO)"
 # ─────────────────────────────────────────────────────────────────────────────
-if ! command -v minio >/dev/null 2>&1; then
+if ! command -v minio >"$NULL" 2>&1; then
   curl -fsSLo /tmp/minio.deb https://dl.min.io/server/minio/release/linux-amd64/minio.deb
-  dpkg -i /tmp/minio.deb >/dev/null
+  dpkg -i /tmp/minio.deb >"$NULL"
   rm -f /tmp/minio.deb
   ok "minio installe"
 else
   ok "minio deja installe"
 fi
 
-if ! command -v mc >/dev/null 2>&1; then
+if ! command -v mc >"$NULL" 2>&1; then
   curl -fsSLo /tmp/mc https://dl.min.io/client/mc/release/linux-amd64/mc
   install -m 0755 /tmp/mc /usr/local/bin/mc
   rm -f /tmp/mc
   ok "client mc installe"
 fi
 
-id -u minio-user >/dev/null 2>&1 || \
+id -u minio-user >"$NULL" 2>&1 || \
   useradd --system --home-dir /var/lib/minio --shell /usr/sbin/nologin minio-user
 mkdir -p /var/lib/minio
 chown -R minio-user:minio-user /var/lib/minio
@@ -427,30 +494,30 @@ MINIO_ROOT_PASSWORD=$MINIO_ROOT_PASSWORD
 EOF
 chmod 600 /etc/default/minio
 
-systemctl enable minio >/dev/null
+systemctl enable minio >"$NULL"
 systemctl restart minio
 wait_for_port 9000 90 || die "MinIO n'ecoute pas sur 9000 — voir: journalctl -u minio -n 50"
 ok "minio en ecoute sur 127.0.0.1:9000 (console 9001)"
 
-mc alias set endless "http://127.0.0.1:9000" "$MINIO_ROOT_USER" "$MINIO_ROOT_PASSWORD" >/dev/null
-mc mb --ignore-existing "endless/$BUCKET" >/dev/null
+mc alias set endless "http://127.0.0.1:9000" "$MINIO_ROOT_USER" "$MINIO_ROOT_PASSWORD" >"$NULL"
+mc mb --ignore-existing "endless/$BUCKET" >"$NULL"
 # Une cle dediee a l'API plutot que les identifiants root.
-if mc admin user info endless "$S3_USER" >/dev/null 2>&1; then
-  mc admin user remove endless "$S3_USER" >/dev/null
+if mc admin user info endless "$S3_USER" >"$NULL" 2>&1; then
+  mc admin user remove endless "$S3_USER" >"$NULL"
 fi
-mc admin user add endless "$S3_USER" "$S3_SECRET" >/dev/null
-mc admin policy attach endless readwrite --user "$S3_USER" >/dev/null 2>&1 || true
+mc admin user add endless "$S3_USER" "$S3_SECRET" >"$NULL"
+mc admin policy attach endless readwrite --user "$S3_USER" >"$NULL" 2>&1 || true
 ok "bucket '$BUCKET' et cle applicative '$S3_USER' prets"
 note "le bucket reste prive : les lectures passent par des URL presignees"
 
 # ─────────────────────────────────────────────────────────────────────────────
 step "Compilation du backend (Rust 1.92, long a la premiere execution)"
 # ─────────────────────────────────────────────────────────────────────────────
-if ! as_service_user 'command -v cargo' >/dev/null 2>&1; then
+if ! as_service_user 'command -v cargo' >"$NULL" 2>&1; then
   as_service_user 'curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --no-modify-path'
   ok "rustup installe pour '$SERVICE_USER'"
 fi
-as_service_user "source \$HOME/.cargo/env && cd '$BACKEND_SRC' && cargo build --release"
+as_service_user "source \$HOME/.cargo/env && cd '$BACKEND_SRC' && cargo build --release $CARGO_FLAGS"
 
 BACKEND_BIN="$(find "$BACKEND_SRC/target/release" -maxdepth 1 -type f -name 'plus-backend*' ! -name '*.d' | head -n1)"
 [[ -n "$BACKEND_BIN" ]] || die "binaire plus-backend introuvable dans $BACKEND_SRC/target/release"
@@ -466,12 +533,12 @@ if (( SKIP_RENDER )); then
 elif [[ ! -d "$RENDER_SRC" ]]; then
   note "render-service absent du depot ; ignore"
 else
-  apt-get -y -qq install chromium >/dev/null 2>&1 || apt-get -y -qq install chromium-browser >/dev/null 2>&1 || true
+  apt-get -y $APT_Q install chromium >"$NULL" 2>&1 || apt-get -y $APT_Q install chromium-browser >"$NULL" 2>&1 || true
   CHROMIUM_BIN="$(command -v chromium || command -v chromium-browser || true)"
   if [[ -z "$CHROMIUM_BIN" ]]; then
     note "aucun chromium installable ; service de rendu ignore"
   else
-    as_service_user "cd '$RENDER_SRC' && PUPPETEER_SKIP_DOWNLOAD=true npm ci --no-audit --no-fund"
+    as_service_user "cd '$RENDER_SRC' && PUPPETEER_SKIP_DOWNLOAD=true npm ci $NPM_FLAGS"
     as_service_user "cd '$RENDER_SRC' && node scripts/fetch-default-skin.mjs" || note "skin par defaut non recuperee"
 
     cat > /etc/systemd/system/endless-render.service <<EOF
@@ -507,7 +574,7 @@ ReadWritePaths=$RENDER_SRC
 WantedBy=multi-user.target
 EOF
     systemctl daemon-reload
-    systemctl enable endless-render >/dev/null
+    systemctl enable endless-render >"$NULL"
     systemctl restart endless-render
     # Le premier lancement de Chrome est lent sur un petit VPS.
     if wait_for_port 8090 150; then
@@ -587,7 +654,7 @@ RestrictAddressFamilies=AF_INET AF_INET6
 WantedBy=multi-user.target
 EOF
 systemctl daemon-reload
-systemctl enable endless-backend >/dev/null
+systemctl enable endless-backend >"$NULL"
 systemctl restart endless-backend
 # Les migrations tournent avant que la socket ne s'ouvre : attendre le port,
 # c'est attendre la fin des migrations.
@@ -600,7 +667,7 @@ step "Boutique (plus-website)"
 # NEXT_PUBLIC_* est inline a la compilation : le fichier doit exister avant.
 printf 'NEXT_PUBLIC_BACKEND_URL=%s\n' "$URL_API" > "$SHOP_SRC/.env.local"
 chown "$SERVICE_USER:$SERVICE_USER" "$SHOP_SRC/.env.local"
-as_service_user "cd '$SHOP_SRC' && npm ci --no-audit --no-fund && npm run build"
+as_service_user "cd '$SHOP_SRC' && npm ci $NPM_FLAGS && npm run build"
 
 cat > /etc/systemd/system/endless-shop.service <<EOF
 [Unit]
@@ -628,7 +695,7 @@ ReadWritePaths=$SHOP_SRC/.next
 WantedBy=multi-user.target
 EOF
 systemctl daemon-reload
-systemctl enable endless-shop >/dev/null
+systemctl enable endless-shop >"$NULL"
 systemctl restart endless-shop
 wait_for_port 3000 180 || note "la boutique n'a pas ouvert le port 3000 — voir: journalctl -u endless-shop -n 60"
 ok "endless-shop actif sur 127.0.0.1:3000, API pointee sur $URL_API"
@@ -646,7 +713,7 @@ for f in "$DASH_SRC/src/lib/settings.ts" "$DASH_SRC/src/routes/index.tsx"; do
   fi
 done
 
-as_service_user "cd '$DASH_SRC' && npm ci --no-audit --no-fund && npm run build"
+as_service_user "cd '$DASH_SRC' && npm ci $NPM_FLAGS && npm run build"
 rm -rf "$BASE_DIR/web/admin"
 cp -r "$DASH_SRC/dist" "$BASE_DIR/web/admin"
 chown -R "$SERVICE_USER:$SERVICE_USER" "$BASE_DIR/web/admin"
@@ -656,7 +723,7 @@ ok "bundle statique deploye dans $BASE_DIR/web/admin"
 
 # Le champ mot de passe du dashboard protege l'API, pas la page : on met aussi
 # une authentification HTTP devant le site.
-htpasswd -bc "$HTPASSWD_FILE" "$ADMIN_HTTP_USER" "$ADMIN_HTTP_PASSWORD" >/dev/null 2>&1
+htpasswd -bc "$HTPASSWD_FILE" "$ADMIN_HTTP_USER" "$ADMIN_HTTP_PASSWORD" >"$NULL" 2>&1
 chmod 640 "$HTPASSWD_FILE"
 chown root:www-data "$HTPASSWD_FILE"
 ok "authentification HTTP posee sur $HOST_ADMIN (utilisateur '$ADMIN_HTTP_USER')"
@@ -687,8 +754,8 @@ server {
 }
 EOF
 ln -sf /etc/nginx/sites-available/endlessclient /etc/nginx/sites-enabled/endlessclient
-nginx -t >/dev/null || die "configuration nginx invalide"
-systemctl enable nginx >/dev/null
+nginx -t >"$NULL" || die "configuration nginx invalide"
+systemctl enable nginx >"$NULL"
 systemctl restart nginx
 ok "vhost HTTP temporaire en place"
 
@@ -696,7 +763,7 @@ CERT_DIR=""
 if (( SKIP_TLS )); then
   note "TLS ignore (--skip-tls) : tout sera servi en clair"
 else
-  apt-get -y -qq install certbot python3-certbot-nginx
+  apt-get -y $APT_Q install certbot python3-certbot-nginx
   cert_args=()
   for host in "${ALL_HOSTS[@]}"; do cert_args+=(-d "$host"); done
   if certbot certonly --webroot -w /var/www/html "${cert_args[@]}" \
@@ -896,10 +963,10 @@ sed -i \
   -e "s#@@HTPASSWD@@#$HTPASSWD_FILE#g" -e "s#@@WEBROOT@@#$BASE_DIR/web/admin#g" \
   /etc/nginx/sites-available/endlessclient
 
-nginx -t >/dev/null || die "configuration nginx invalide — voir: nginx -t"
+nginx -t >"$NULL" || die "configuration nginx invalide — voir: nginx -t"
 systemctl reload nginx
 ok "nginx sert les 5 hotes"
-if (( ! SKIP_TLS )) && systemctl list-timers 2>/dev/null | grep -q certbot; then
+if (( ! SKIP_TLS )) && systemctl list-timers 2>"$NULL" | grep -q certbot; then
   ok "renouvellement automatique du certificat actif"
 fi
 
@@ -942,7 +1009,7 @@ fi
 step "Premier administrateur"
 # ─────────────────────────────────────────────────────────────────────────────
 if [[ -z "$ADMIN_UUID" && -n "$ADMIN_NAME" ]]; then
-  raw="$(curl -fsS "https://api.mojang.com/users/profiles/minecraft/$ADMIN_NAME" 2>/dev/null | jq -r '.id // empty')"
+  raw="$(curl -fsS "https://api.mojang.com/users/profiles/minecraft/$ADMIN_NAME" 2>"$NULL" | jq -r '.id // empty')"
   if [[ -n "$raw" ]]; then
     ADMIN_UUID="$(dash_uuid "$raw")"
   else
@@ -967,7 +1034,7 @@ step "PolyPlus"
 if (( ! PATCH_POLYPLUS )); then
   note "BackendUrl.kt non modifie (--patch-polyplus pour le faire)"
 else
-  mapfile -t kt_files < <(find "$SRC_ROOT/PolyPlus" -name BackendUrl.kt 2>/dev/null || true)
+  mapfile -t kt_files < <(find "$SRC_ROOT/PolyPlus" -name BackendUrl.kt 2>"$NULL" || true)
   if (( ${#kt_files[@]} == 0 )); then
     note "BackendUrl.kt introuvable ; PolyPlus n'est peut-etre pas dans ce depot"
   else
@@ -1019,7 +1086,7 @@ Persistent=true
 WantedBy=timers.target
 EOF
 systemctl daemon-reload
-systemctl enable --now endless-backup.timer >/dev/null
+systemctl enable --now endless-backup.timer >"$NULL"
 ok "sauvegarde quotidienne active (/var/backups/endless)"
 note "une sauvegarde sur le meme disque n'est pas une sauvegarde : copiez-la ailleurs"
 
@@ -1038,24 +1105,24 @@ if (( RENDER_ENABLED )); then
   systemctl is-active --quiet endless-render && ok "endless-render actif" || note "endless-render INACTIF"
 fi
 
-paths="$(curl -fsS --max-time 15 "$URL_API/openapi.json" 2>/dev/null | jq '.paths | keys | length' 2>/dev/null || true)"
+paths="$(curl -fsS --max-time 15 "$URL_API/openapi.json" 2>"$NULL" | jq '.paths | keys | length' 2>"$NULL" || true)"
 if [[ -n "$paths" ]]; then ok "$URL_API/openapi.json repond, $paths routes"
 else note "$URL_API/openapi.json injoignable"; CHECKS_OK=0; fi
 
-count="$(curl -fsS --max-time 15 "$URL_API/cosmetics" 2>/dev/null | jq '.cosmetics | length' 2>/dev/null || true)"
+count="$(curl -fsS --max-time 15 "$URL_API/cosmetics" 2>"$NULL" | jq '.cosmetics | length' 2>"$NULL" || true)"
 [[ -n "$count" ]] && ok "$URL_API/cosmetics repond, $count cosmetique(s)" || true
 
-code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 15 "$URL_SHOP/" 2>/dev/null || true)"
+code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 15 "$URL_SHOP/" 2>"$NULL" || true)"
 [[ "$code" == "200" ]] && ok "boutique $URL_SHOP -> 200" || note "boutique $URL_SHOP -> ${code:-injoignable}"
 
-code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 15 -u "$ADMIN_HTTP_USER:$ADMIN_HTTP_PASSWORD" "$URL_ADMIN/" 2>/dev/null || true)"
+code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 15 -u "$ADMIN_HTTP_USER:$ADMIN_HTTP_PASSWORD" "$URL_ADMIN/" 2>"$NULL" || true)"
 [[ "$code" == "200" ]] && ok "dashboard $URL_ADMIN -> 200 (avec auth HTTP)" || note "dashboard $URL_ADMIN -> ${code:-injoignable}"
 
 # 101 ou 426, jamais 200 : un 200 signifie que nginx n'a pas relaye l'upgrade.
 code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 15 \
   -H 'Connection: Upgrade' -H 'Upgrade: websocket' \
   -H 'Sec-WebSocket-Version: 13' -H 'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==' \
-  "$URL_API/websocket" 2>/dev/null || true)"
+  "$URL_API/websocket" 2>"$NULL" || true)"
 if [[ "$code" == "101" || "$code" == "426" ]]; then ok "websocket -> $code"
 else note "websocket -> ${code:-injoignable} (attendu 101 ou 426)"; fi
 
@@ -1066,7 +1133,7 @@ umask 077
 cat > "$CRED_FILE" <<EOF
 ================================================================================
  EndlessClient — identifiants generes
- Serveur   : $(hostname -f 2>/dev/null || hostname)
+ Serveur   : $(hostname -f 2>"$NULL" || hostname)
  Domaine   : $DOMAIN
  Genere le : $(date -u '+%Y-%m-%d %H:%M:%S UTC')
 ================================================================================
@@ -1177,6 +1244,10 @@ printf '  Assets            %s\n' "$URL_CDN"
 printf '\n  Identifiants      %s\n' "$CRED_FILE"
 printf '  Les lire          sudo cat %s\n' "$CRED_FILE"
 printf '  Les recuperer     scp root@%s:%s .\n\n' "$DOMAIN" "$CRED_FILE"
+if (( DEBUG )); then
+  printf '  Trace debug       %s\n' "$DEBUG_LOG"
+  printf '%s  Elle contient les mots de passe en clair : supprimez-la apres usage.%s\n\n' "$C_WARN" "$C_RESET"
+fi
 (( CHECKS_OK )) || printf '%s  Des verifications ont echoue — relisez la section Verification ci-dessus.%s\n\n' "$C_WARN" "$C_RESET"
 (( SKIP_TLS )) && printf '%s  Servi en HTTP : relancez sans --skip-tls une fois le DNS propage.%s\n\n' "$C_WARN" "$C_RESET" || true
 exit 0
