@@ -166,6 +166,40 @@ Deux modifications de sources, nécessaires et signalées à l'exécution :
 
 ---
 
+## Mettre à jour
+
+```bash
+sudo ./update.sh
+```
+
+Une commande : sauvegarde de la base, `git pull`, recompilation du backend,
+reconstruction de la boutique et du dashboard, redémarrage des services,
+vérifications. Les secrets, le schéma, nginx et les certificats ne sont pas
+touchés.
+
+| Option | Effet |
+| --- | --- |
+| `--only backend\|shop\|dashboard\|render` | Un seul composant |
+| `--no-pull` | Recompile ce qui est déjà en place, sans `git pull` |
+| `--no-backup` | Saute le dump préalable (déconseillé) |
+| `--debug` | Trace complète, comme pour `install.sh` |
+
+Trois précautions y sont câblées :
+
+- **Un dump `pg_dump` avant tout**, dans `/var/backups/endless`. Les migrations
+  s'appliquent au démarrage du backend et ne sont pas réversibles en place.
+- **Le backend est arrêté avant d'être remplacé**, jamais deux instances sur la
+  même base pendant qu'une migration tourne.
+- **Le dashboard n'est déployé que si son build a produit un `dist/`** :
+  l'ancien bundle reste servi tant que le nouveau n'existe pas.
+
+À savoir : `plus-website` et `plus-admin-dashboard` étant des sous-modules sans
+`.gitmodules`, **`git pull` ne les met jamais à jour**. Le script le signale à
+chaque exécution. Leur mise à jour passe par un transfert manuel de vos sources,
+suivi de `sudo ./update.sh --no-pull`.
+
+---
+
 ## Mode debug
 
 Quand une étape échoue sans explication suffisante :

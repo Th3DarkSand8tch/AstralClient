@@ -433,9 +433,17 @@ RENDER_SRC="$BACKEND_SRC/render-service"
 # Un depot ou une branche qui ne contient pas plus-website faisait echouer
 # l'etape "Boutique" des sa premiere redirection, sans aucun message.
 for required in "$BACKEND_SRC" "$SHOP_SRC" "$DASH_SRC"; do
-  # `[[ ... ]] && continue` renverrait 1 quand le dossier manque, ce qui
-  # declencherait le piege ERR au lieu du message explicite ci-dessous.
-  if [[ -d "$required" ]]; then continue; fi
+  # Tester -d ne suffit pas : ce depot declare plus-website et
+  # plus-admin-dashboard comme sous-modules (gitlink, mode 160000) mais ne
+  # fournit aucun .gitmodules. Un clone cree donc des dossiers VIDES, que -d
+  # accepte, et l'echec ne surgit qu'au npm install, sans rapport apparent.
+  if [[ -d "$required" && -n "$(ls -A "$required" 2>/dev/null)" ]]; then continue; fi
+  if [[ -d "$required" ]]; then
+    note "$(basename "$required") existe mais est VIDE."
+    note "Ce depot le declare comme sous-module sans .gitmodules : aucun clone ne"
+    note "peut le remplir. Transferez votre copie locale sur le serveur, puis"
+    note "relancez avec --src-dir, ou copiez le dossier dans $SRC_ROOT."
+  fi
   note "contenu reel de $SRC_ROOT :"
   ls -1 "$SRC_ROOT" | sed 's/^/            /'
   die "$(basename "$required") introuvable — mauvais depot ou mauvaise branche ? voir --repo-url, --branch, --src-dir"
@@ -753,6 +761,17 @@ for f in "$DASH_SRC/src/lib/settings.ts" "$DASH_SRC/src/routes/index.tsx"; do
   fi
 done
 
+# Reecrire les options ne suffit pas : DEFAULT_ENV vaut ENV_OPTIONS[0].value,
+# soit http://127.0.0.1:8080. Depuis un navigateur sur https://admin.<domaine>
+# cette adresse designe la machine du visiteur, et un appel http:// depuis une
+# page https est de toute facon bloque en contenu mixte. Resultat vu par
+# l'utilisateur : "Network error: TypeError: Failed to fetch".
+if [[ -f "$DASH_SRC/src/lib/settings.ts" ]] && grep -q '^export const DEFAULT_ENV' "$DASH_SRC/src/lib/settings.ts"; then
+  sed -i "s#^export const DEFAULT_ENV = .*#export const DEFAULT_ENV = \"$URL_API\";#" \
+    "$DASH_SRC/src/lib/settings.ts"
+  ok "environnement par defaut du dashboard : $URL_API"
+fi
+
 js_install "$DASH_SRC" "dashboard"
 as_service_user "cd '$DASH_SRC' && npm run build"
 rm -rf "$BASE_DIR/web/admin"
@@ -898,8 +917,8 @@ server {
 
 # ─── API ──────────────────────────────────────────────────────────────────
 server {
-    listen 443 ssl; listen [::]:443 ssl;
-    http2 on;
+    @@LISTEN443@@
+@@HTTP2@@
     server_name @@API@@;
 
     ssl_certificate     @@CERTDIR@@/fullchain.pem;
@@ -930,8 +949,8 @@ server {
 
 # ─── boutique ─────────────────────────────────────────────────────────────
 server {
-    listen 443 ssl; listen [::]:443 ssl;
-    http2 on;
+    @@LISTEN443@@
+@@HTTP2@@
     server_name @@SHOP@@;
 
     ssl_certificate     @@CERTDIR@@/fullchain.pem;
@@ -946,8 +965,8 @@ server {
 }
 
 server {
-    listen 443 ssl; listen [::]:443 ssl;
-    http2 on;
+    @@LISTEN443@@
+@@HTTP2@@
     server_name @@WWW@@;
     ssl_certificate     @@CERTDIR@@/fullchain.pem;
     ssl_certificate_key @@CERTDIR@@/privkey.pem;
@@ -956,8 +975,8 @@ server {
 
 # ─── dashboard admin ──────────────────────────────────────────────────────
 server {
-    listen 443 ssl; listen [::]:443 ssl;
-    http2 on;
+    @@LISTEN443@@
+@@HTTP2@@
     server_name @@ADMIN@@;
 
     ssl_certificate     @@CERTDIR@@/fullchain.pem;
@@ -973,8 +992,8 @@ server {
 
 # ─── stockage objet ───────────────────────────────────────────────────────
 server {
-    listen 443 ssl; listen [::]:443 ssl;
-    http2 on;
+    @@LISTEN443@@
+@@HTTP2@@
     server_name @@CDN@@;
 
     ssl_certificate     @@CERTDIR@@/fullchain.pem;
@@ -997,14 +1016,36 @@ server {
 NGINX
 fi
 
+# La directive `http2 on;` n'existe qu'a partir de nginx 1.25.1. Debian 12
+# livre 1.22.1, ou elle fait echouer `nginx -t` avec "unknown directive". Sur
+# ces versions HTTP/2 s'active par un parametre de `listen`. On choisit donc la
+# syntaxe selon la version reellement installee.
+NGINX_VER="$(nginx -v 2>&1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1)"
+if [[ -n "$NGINX_VER" ]] && \
+   [[ "$(printf '%s\n%s\n' '1.25.1' "$NGINX_VER" | sort -V | head -n1)" == "1.25.1" ]]; then
+  LISTEN443='listen 443 ssl; listen [::]:443 ssl;'
+  HTTP2_LINE='    http2 on;'
+  ok "nginx $NGINX_VER : syntaxe http2 moderne"
+else
+  LISTEN443='listen 443 ssl http2; listen [::]:443 ssl http2;'
+  HTTP2_LINE=''
+  ok "nginx ${NGINX_VER:-inconnu} : http2 active via listen (< 1.25.1)"
+fi
+
 sed -i \
+  -e "s#@@LISTEN443@@#$LISTEN443#g" -e "s#^@@HTTP2@@\$#$HTTP2_LINE#g" \
   -e "s#@@SHOP@@#$HOST_SHOP#g"  -e "s#@@WWW@@#$HOST_WWW#g" \
   -e "s#@@API@@#$HOST_API#g"    -e "s#@@ADMIN@@#$HOST_ADMIN#g" \
   -e "s#@@CDN@@#$HOST_CDN#g"    -e "s#@@CERTDIR@@#$CERT_DIR#g" \
   -e "s#@@HTPASSWD@@#$HTPASSWD_FILE#g" -e "s#@@WEBROOT@@#$BASE_DIR/web/admin#g" \
   /etc/nginx/sites-available/endlessclient
 
-nginx -t >"$NULL" || die "configuration nginx invalide — voir: nginx -t"
+# Montrer ce que nginx reproche : sans ca on meurt sur "configuration invalide"
+# sans savoir quelle directive, ni a quelle ligne.
+if ! nginx -t >"$NULL" 2>&1; then
+  nginx -t 2>&1 | sed 's/^/         /' >&2 || true
+  die "configuration nginx invalide (detail ci-dessus)"
+fi
 systemctl reload nginx
 ok "nginx sert les 5 hotes"
 if (( ! SKIP_TLS )) && systemctl list-timers 2>"$NULL" | grep -q certbot; then
