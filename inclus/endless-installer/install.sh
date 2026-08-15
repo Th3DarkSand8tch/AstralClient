@@ -96,7 +96,14 @@ on_error() {
   else
     printf '\n       relancez avec --debug pour la trace complete de chaque commande\n' >&2
   fi
-  printf '       journal        : %s\n\n' "$LOG_FILE" >&2
+  # La trace xtrace part sur son propre descripteur et ne contient donc PAS la
+  # sortie des commandes : c'est le journal qui porte le message d'erreur reel.
+  # Sans ce rappel, on reste devant un "code 1" sans explication.
+  if [[ -s "$LOG_FILE" ]]; then
+    printf '\n       dernieres lignes du journal (la vraie erreur est ici) :\n' >&2
+    tail -n 30 "$LOG_FILE" 2>/dev/null | sed 's/^/         /' >&2 || true
+  fi
+  printf '\n       journal        : %s\n\n' "$LOG_FILE" >&2
   exit "$code"
 }
 trap 'on_error "$LINENO" "$BASH_COMMAND"' ERR
@@ -199,6 +206,22 @@ as_service_user() {
 }
 
 gen_secret() { openssl rand -base64 36 | tr -d '\n/+=' | cut -c1-40; }
+
+# `npm ci` exige un lockfile et echoue sinon. Or seul render-service en versionne
+# un : plus-website et plus-admin-dashboard listent package-lock.json dans leur
+# .gitignore, donc un depot fraichement clone n'en a pas. On retombe alors sur
+# `npm install`, qui resout depuis package.json et ecrit le lockfile au passage.
+js_install() {
+  local dir="$1" label="$2" prefix="${3:-}"
+  local cmd
+  if [[ -f "$dir/package-lock.json" ]]; then
+    cmd="npm ci $NPM_FLAGS"
+  else
+    note "$label : aucun package-lock.json versionne, bascule sur npm install"
+    cmd="npm install $NPM_FLAGS"
+  fi
+  as_service_user "cd '$dir' && $prefix$cmd"
+}
 
 # Relit une valeur deja generee lors d'une execution precedente, sinon en cree
 # une. Sans cela, relancer le script casserait Postgres et MinIO, dont les mots
@@ -538,7 +561,7 @@ else
   if [[ -z "$CHROMIUM_BIN" ]]; then
     note "aucun chromium installable ; service de rendu ignore"
   else
-    as_service_user "cd '$RENDER_SRC' && PUPPETEER_SKIP_DOWNLOAD=true npm ci $NPM_FLAGS"
+    js_install "$RENDER_SRC" "render-service" "PUPPETEER_SKIP_DOWNLOAD=true "
     as_service_user "cd '$RENDER_SRC' && node scripts/fetch-default-skin.mjs" || note "skin par defaut non recuperee"
 
     cat > /etc/systemd/system/endless-render.service <<EOF
@@ -667,7 +690,24 @@ step "Boutique (plus-website)"
 # NEXT_PUBLIC_* est inline a la compilation : le fichier doit exister avant.
 printf 'NEXT_PUBLIC_BACKEND_URL=%s\n' "$URL_API" > "$SHOP_SRC/.env.local"
 chown "$SERVICE_USER:$SERVICE_USER" "$SHOP_SRC/.env.local"
-as_service_user "cd '$SHOP_SRC' && npm ci $NPM_FLAGS && npm run build"
+js_install "$SHOP_SRC" "boutique"
+as_service_user "cd '$SHOP_SRC' && npm run build"
+
+# next.config.ts declare output: "standalone". Dans ce mode `next start` refuse
+# de demarrer : Next attend qu'on lance .next/standalone/server.js. Et il n'y
+# copie ni les assets statiques ni public/, c'est a l'integrateur de le faire.
+if [[ -f "$SHOP_SRC/.next/standalone/server.js" ]]; then
+  as_service_user "cd '$SHOP_SRC' && mkdir -p .next/standalone/.next && cp -r .next/static .next/standalone/.next/"
+  if [[ -d "$SHOP_SRC/public" ]]; then
+    as_service_user "cd '$SHOP_SRC' && cp -r public .next/standalone/"
+  fi
+  SHOP_WORKDIR="$SHOP_SRC/.next/standalone"
+  SHOP_EXEC="/usr/bin/node server.js"
+  ok "build standalone : assets statiques et public/ copies"
+else
+  SHOP_WORKDIR="$SHOP_SRC"
+  SHOP_EXEC="/usr/bin/npm run start"
+fi
 
 cat > /etc/systemd/system/endless-shop.service <<EOF
 [Unit]
@@ -677,11 +717,11 @@ Wants=network-online.target
 
 [Service]
 User=$SERVICE_USER
-WorkingDirectory=$SHOP_SRC
+WorkingDirectory=$SHOP_WORKDIR
 Environment=NODE_ENV=production
 Environment=PORT=3000
 Environment=HOSTNAME=127.0.0.1
-ExecStart=/usr/bin/npm run start
+ExecStart=$SHOP_EXEC
 Restart=on-failure
 RestartSec=5s
 
@@ -713,7 +753,8 @@ for f in "$DASH_SRC/src/lib/settings.ts" "$DASH_SRC/src/routes/index.tsx"; do
   fi
 done
 
-as_service_user "cd '$DASH_SRC' && npm ci $NPM_FLAGS && npm run build"
+js_install "$DASH_SRC" "dashboard"
+as_service_user "cd '$DASH_SRC' && npm run build"
 rm -rf "$BASE_DIR/web/admin"
 cp -r "$DASH_SRC/dist" "$BASE_DIR/web/admin"
 chown -R "$SERVICE_USER:$SERVICE_USER" "$BASE_DIR/web/admin"
